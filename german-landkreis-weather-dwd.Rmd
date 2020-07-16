@@ -1,0 +1,748 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r data grouping, filtering and completing}
+if (!require("tidyverse")) install.packages("tidyverse")
+if (!require("readr")) install.packages("readr")
+if (!require("readxl")) install.packages("readxl")
+if (!require("ggplot2")) install.packages("ggplot2")
+library(tidyverse)
+library(readr)
+library(readxl)
+library(ggplot2)
+
+
+# using readr
+rki_df <- read_csv("input/RKI_COVID19.csv")
+print(head(rki_df))
+
+start_day <- as.Date("2020-03-01")
+end_day <- as.Date("2020-04-01")
+maxLag <- 20
+
+# helper function: specify_decimal(0.1239249249294, 3) = 0.123
+specify_decimal <- function(x, k) trimws(format(round(x, k), nsmall=k))
+
+# RKI-quote: damit ergibt sich: Anzahl F???lle der aktuellen Publikation als Summe(AnzahlFall), wenn NeuerFall in (0,1); Delta zum Vortag als Summe(AnzahlFall) wenn NeuerFall in (-1,1)
+per_county_and_day <- rki_df %>%
+                      # time line for each Landkreis
+                      group_by(IdLandkreis, Landkreis, Refdatum) %>%
+                      filter(IstErkrankungsbeginn == 1) %>%
+                      # do not include duplicates
+                      summarise(NeueFaelle = sum(AnzahlFall[NeuerFall %in% c(0,1)])) %>%   
+                      # convert date and drop hours, minutes and seconds
+                      mutate(Refdatum = as.Date(Refdatum, format ='%Y/%m/%d')) %>%  
+                      # generate the time span for all Landkreise (if no cases got reported 
+                      # on a specific day, the landkreis is not mentioned)
+                      complete(Refdatum = seq.Date(as.Date("2020-01-01"), max(Refdatum), by="day")) %>% 
+                      # generated aggregate "faelle" in previous steps is <na>, replace it by 0 cases
+                      mutate(NeueFaelle = replace_na(NeueFaelle, 0)) %>% 
+                      # library magic, easy cumsum bulding (sum of all past cases per landkreis for a specific date)
+                      mutate(GesamtFaelleLandkreis = cumsum(NeueFaelle))  
+
+k <- rki_df %>%
+  distinct(IdLandkreis)
+k
+
+per_county_and_day
+
+```
+```{r visualization}
+
+# useless visualization
+ggplot(per_county_and_day, aes(x=Refdatum, y=GesamtFaelleLandkreis))+ 
+      geom_line(aes(group = Landkreis, color=per_county_and_day$Landkreis)) + 
+      theme(legend.position = "none") +
+      ggtitle("Gesamtanzahl Faelle pro Landkreis")
+
+
+
+# Total infections per day
+ggplot( per_county_and_day %>%
+        group_by(Refdatum) %>%
+        summarise(infections_per_day = sum(NeueFaelle)), aes(x=Refdatum, y=infections_per_day))+ 
+      geom_line() + 
+      theme(legend.position = "none") +
+  ggtitle("Gesamtanzahl Neuinfektionen in ganz Deutschland")
+
+
+
+
+ggplot( per_county_and_day %>%
+          filter(Refdatum >= start_day & Refdatum <= end_day) %>%
+        group_by(Refdatum) %>%
+        summarise(infections_per_day = sum(NeueFaelle)), aes(x=Refdatum, y=infections_per_day))+ 
+      geom_line() + 
+      theme(legend.position = "none") +
+    ggtitle("Neuinfektionen in ganz Deutschland im untersuchtem Bereich")
+
+
+
+
+ggplot(per_county_and_day, aes(x=Refdatum, y=NeueFaelle))+ 
+      geom_line(aes(group = Landkreis, color=per_county_and_day$Landkreis)) + 
+      theme(legend.position = "none") +
+      ggtitle("Neuinfektionen pro Landkreis")
+
+
+
+
+per_county_and_day_range <- per_county_and_day %>%
+          filter(Refdatum >= start_day & Refdatum <= end_day)
+
+per_county_and_day_range
+
+ggplot(per_county_and_day_range, aes(x=Refdatum, y=NeueFaelle)) + 
+      geom_line(aes(group = Landkreis, color=per_county_and_day_range$Landkreis)) + 
+      theme(legend.position = "none") +
+      ggtitle("Neuinfektionen pro Landkreis im untersuchtem Bereich")
+```
+
+<h2>Landkreise Geo data</h2>
+
+```{r}
+# https://public.opendatasoft.com/explore/dataset/landkreise-in-germany/
+
+geo_landkreise_raw<- read_delim("input/landkreise-in-germany.csv", 
+    ";", escape_double = FALSE, trim_ws = TRUE)
+head(geo_landkreise_raw)
+
+# Transform "GeoPoint"- string to double values LAT and LON
+landkreis_info_list <- geo_landkreise_raw %>%
+  # CCa equals idLandkreis in RKI dataset! Wuhu!
+  select(`Geo Point`, `Name 2`, `Cca 2`) %>%  
+  mutate(
+    #Stack overflow magic .sapply()
+    LAT = as.double(sapply(strsplit(geo_landkreise_raw$`Geo Point`, ","), `[`, 1)),
+    #Stack overflow magic .sapply()
+    LON = as.double(sapply(strsplit(geo_landkreise_raw$`Geo Point`, ","), `[`, 2)) 
+  ) %>%
+  rename(Name = `Name 2`) %>%
+  # Rename id column to match the RKI dataset
+  rename(IdLandkreis = `Cca 2`)%>%
+  # unselect string "GeoPoint" because it will not get used anymore
+  select(-`Geo Point`)
+
+landkreis_info_list
+
+#Plot Landkreis position
+landkreis_info_list %>%
+  ggplot(aes(x=LON, y=LAT)) + 
+  geom_point(alpha=1,  color="orange", size=0.5) + 
+  coord_equal() + 
+  ggtitle("LAT & LONG (Position) of each Landkreis")
+```
+
+<h2> weather dataset </h2>
+```{r weather setup}
+if (!require("rgeos")) install.packages("rgeos")
+if (!require("geosphere")) install.packages("geosphere")
+if (!require("readxl")) install.packages("readxl")
+if (!require("zoo")) install.packages("zoo")
+if (!require("sp")) install.packages("sp")
+
+library(tidyverse)
+library(geosphere)
+library(readxl)
+#library(rgeos)
+library(zoo)
+library(sp)
+
+#All file paths
+noaa_station_directory <- "input/station_directory.txt"
+noaa_station_details <- "input/station_list_details.txt"
+
+noaa_station_download_url <- "https://www.ncei.noaa.gov/data/global-summary-of-the-day/access/2020"
+
+gsod_filenames <- read.table(noaa_station_directory, header = FALSE,
+                             stringsAsFactors = FALSE,
+                             col.names = c("file","last_modified","time","size"))
+
+
+#Set up filenames for all stations
+gsod_filenames <- gsod_filenames %>%
+  mutate(station_id = sub(".csv", "", file)) %>%
+  select(file, last_modified, station_id)
+
+#Reading this fixed-width file is a mess
+noaa_col_names <- c("USAF",
+                    "WBAN",
+                    "STATION_NAME",
+                    "CTRY",
+                    "ST",
+                    "CALL",
+                    "LAT",
+                    "LON",
+                    "ELEV_M",
+                    "BEGIN",
+                    "END")
+
+#Get station locations
+noaa_stations <- read_fwf(noaa_station_details, 
+                              fwf_positions(c(1, 8, 14, 44, 49, 52, 58, 66, 75, 83, 92), 
+                                            c(7,13, 43, 46, 51, 56, 65, 74, 82, 91, 99), 
+                                            noaa_col_names),
+                              skip = 1, col_types = "ccccccccccc")
+noaa_stations
+#Must filter by END > a few days ago
+#Also filter by BEGIN < Jan 1
+#Finally remove the bad stations
+
+#Join location to file names 
+noaa_stations <- noaa_stations %>%
+  unite(usaf_wban, USAF, WBAN, sep="") %>%
+  mutate(LAT = as.numeric(sub("\\+","", LAT)),
+         LON = as.numeric(sub("\\+","", LON)),
+         ELEV_M = as.numeric(sub("\\+","", ELEV_M)),
+         BEGIN = as.Date(BEGIN, format = "%Y%m%d"),
+         END = as.Date(END, format = "%Y%m%d")) %>%
+  inner_join(gsod_filenames,
+             by = c("usaf_wban" = "station_id")) %>%
+  filter(BEGIN <= start_day + maxLag) %>%
+  filter(END >= end_day + maxLag)
+
+  
+#Plot station locations
+noaa_stations %>%
+  filter(CTRY == "GM") %>%
+  ggplot(aes(x=LON, y=LAT)) + 
+  geom_point(data = noaa_stations, 
+             aes(x=LON,y=LAT), 
+             color = "orange", alpha = 0.2, size=0.4) +
+  geom_point(alpha=1,  color="blue", size=0.4) + 
+  coord_equal() + 
+  ggtitle("NOAA GSOD Weather Station Locations (Blue = Stations in Germany)")
+```
+
+
+```{r}
+# Plot weather stations and Landkreis position
+landkreis_info_list[,c("LAT", "LON")]%>%
+  ggplot(aes(x=LON, y=LAT)) + 
+  geom_point(alpha=1, size=1, color = "orange") + 
+  geom_point(data = noaa_stations, 
+             aes(x=LON,y=LAT), 
+             color = "blue", alpha = 0.8, size=0.7) +
+  geom_point(x=13,y=52, color="red")+     # BERLIN just for orientation
+  geom_point(x=7,y=51, color="red")+      # COLOGNEjust for orientation
+  coord_fixed(ratio = 1, xlim = c(5.4,15.3), ylim = c(45,57)) +
+  ggtitle("Landkreise (orange) and all GSOD weather stations (blue)")
+```
+
+Use german weather stations... Deutscher Wetterdienst (dwd)
+```{r}
+# station detail list: https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/kl/recent/KL_Tageswerte_Beschreibung_Stationen.txt
+
+dwd_station_details <- "input/german_station_list_details.txt"
+
+
+dwd_col_names <- c("STATION_ID",   
+                    "BEGIN",     
+                    "END",
+                    "STATION_HEIGHT",
+                    "LAT",
+                    "LON",
+                    "STATION_NAME",
+                    "BUNDESLAND")
+
+
+#Get station locations
+dwd_stations_raw <- read_fwf(dwd_station_details, 
+                         fwf_widths(c(5,9,9,15,12,10,42,54), dwd_col_names),   #Praise jesus, it finally worked
+                              skip = 2, col_types = "ccciddcc")  #c = string, i=integer, d= double
+
+# transforming date from "19930112" to YYYY-mm-dd
+dwd_stations <- dwd_stations_raw %>%
+                          mutate(BEGIN = as.Date(BEGIN, "%Y%m%d"),
+                                 END = as.Date(END, "%Y%m%d")) 
+
+dwd_stations
+
+# Select stations that recorded weather in corona timespan
+dwd_station_list <- dwd_stations %>%
+                    filter(BEGIN <= start_day - maxLag) %>%
+                    filter(END >= end_day)
+
+
+
+
+# Plot weather stations and Landkreis position
+landkreis_info_list[,c("LAT", "LON")]%>%
+  ggplot(aes(x=LON, y=LAT)) + 
+  geom_point(alpha=1, size=1, color = "orange") + 
+  geom_point(data = dwd_station_list, 
+             aes(x=LON,y=LAT), 
+             color = "blue", alpha = 0.8, size=0.7) +
+  geom_point(x=13,y=52, color="red")+     # BERLIN just for orientation
+  geom_point(x=7,y=51, color="red")+      # COLOGNEjust for orientation
+  coord_fixed(ratio = 1, xlim = c(5.4,15.3), ylim = c(47.3,55)) +
+  ggtitle("Landkreise (orange) and ALL DWD weather stations (blue)")
+
+
+
+
+
+
+dwd_lonlat <- cbind(dwd_station_list$LON, dwd_station_list$LAT)
+
+# For each landkreis... generate distance matrix, find nearest
+for (i in 1:nrow(landkreis_info_list)) {
+  #print(i) #for monitoring progress
+  
+  # For each county...
+  this_landkreis_loc <- cbind(landkreis_info_list[i,"LON"], 
+                           landkreis_info_list[i,"LAT"]) 
+  
+  # Get distances to all stations - in km
+  # function from "geospehre"-library
+  distance_to_stations <- distHaversine(this_landkreis_loc, dwd_lonlat)
+  
+  # Note closest station
+  closest_ind <- which.min(distance_to_stations)
+  closest_station_id <- dwd_station_list[closest_ind,"STATION_ID"]
+  
+  landkreis_info_list$closest_station_id[i] <- as.character(closest_station_id)
+  landkreis_info_list$km_to_closest_station[i] <- distance_to_stations[closest_ind]/1000
+  
+} 
+
+closest_dwd_stations <- dwd_station_list %>%
+  filter(STATION_ID %in% landkreis_info_list$closest_station_id)
+
+paste("DWD Stations that recorded in corona times: ", nrow(dwd_station_list))
+paste("Number of Landkreise: ",nrow(landkreis_info_list))
+paste("Number of closest stations", nrow(closest_dwd_stations))
+
+
+# Plot weather stations and Landkreis position
+landkreis_info_list[,c("LAT", "LON")]%>%
+  ggplot(aes(x=LON, y=LAT)) + 
+  geom_point(alpha=1, size=1, color = "orange") + 
+ # geom_point(data = closest_dwd_stations, 
+ #            aes(x=LON,y=LAT), 
+  #           color = "blue", alpha = 0.8, size=0.7) +
+  geom_point(x=13,y=52, color="red")+     # BERLIN just for orientation
+  geom_point(x=7,y=51, color="red")+      # COLOGNEjust for orientation
+  coord_fixed(ratio = 1, xlim = c(5.4,15.3), ylim = c(47.3,55)) +
+  ggtitle("Landkreise (orange)")
+
+# Distribution of distances to closest station
+landkreis_info_list %>%
+  ggplot(aes(x=km_to_closest_station)) + 
+  geom_histogram(binwidth=2 )
+```
+
+
+Download weather day summary data from closest stations.
+1. Download .zip files and save into /download folder
+2. Extract specific "produkt_klima_tag" file to /extract folder
+```{r}
+# https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/kl/recent/tageswerte_KL_00044_akt.zip
+
+options(timeout=3600)
+# ONE TIME USE TO DOWNLOAD STATION DATA
+## DOWNLOADS ALL DATA FROM STATIONS THAT STARTED RECORDING BEFORE 01.01.2020 AND AT LEAST UNTIL 01.06.2020
+if(FALSE){
+  for(id in dwd_station_list[1:50,1]){
+    activity_url <- paste0("https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/kl/recent/tageswerte_KL_", id ,"_akt.zip")
+    #print(activity_url)
+    dest_file <- paste0("download/",basename(activity_url))
+    download.file(activity_url, destfile = dest_file)
+    # only extract specific data file we are looking for
+    # form: produkt_klima_tag_20181208_20200609_00142.txt
+    
+     zipped_csv_name <- grep('produkt_klima_tag_[:alnum:]*', unzip(dest_file, list=TRUE)$Name, 
+                             ignore.case=TRUE, value=TRUE)
+    
+    unzip(dest_file, files=zipped_csv_name, exdir = "extract")
+    }
+}
+
+# mydata <- read.csv(dir(pattern='/download/produkt_klima_tag_[:alnum:]*.txt')[1])
+```
+
+<h2>Sum up until now, we got:<h2>
+
+Info to all landkreise:
+landkreis_info_list <IdLandkreis, Name, LAT, LON, closest_station_id, km_to_closest_station>
+
+Station meta data:
+closest_dwd_stations <STATION_ID, BEGIN, END, STATIONS_HEIGHT, LAT, LON, STATION_NAME, BUNDESLAND>
+
+Daily number of new cases for each landkreis, and cumsum until that date:
+per_county_and_day <IdLandkreis, Landkreis, Refdatum, NeueFaelle, GesamtFaelleLandkreis>
+
+All downloaded weather data in /extract folder in the form:
+produkt_klima_tag_20181208_20200609_00044.txt  
+where 00044 is the stationID.
+
+```{r}
+weather_data <- data.frame()
+
+file_list <- list.files("extract/", pattern=".txt", full.names=T)
+weather_data_raw <- do.call("rbind", lapply(file_list, read.csv, sep = ";"))
+
+weather_data_processed <- weather_data_raw %>%
+                rename(
+                  stationID = STATIONS_ID,
+                  recordingDate = MESS_DATUM,
+                  qualityWindData = QN_3,
+                  maxWindMS = FX,
+                  dailyMeanWindMS = FM,
+                  qualityRest = QN_4,
+                  precipitationMM = RSK, #NiederschmaxLag
+                  precipitationType = RSKF,
+                  dailySunshineH = SDK,
+                  dailySnowDepth = SHK_TAG,
+                  dailyMeanOfCloudCover = NM,
+                  dailyVaporPressureHPA = VPM,
+                  dailyMeanPressure = PM,
+                  dailyMeanTemp = TMK,
+                  dailyMeanRelHumidity = UPM,
+                  dailyMaxTemp = TXK,
+                  dailyMinTemp = TNK,
+                  dailyMinAirTemp = TGK
+                ) %>%
+                # mark all invalid values as NA
+                mutate_all(na_if, -999) %>%
+                # transform date from integer to date type 20200301 -> 2020-03-01
+                mutate(recordingDate = as.Date(as.character(recordingDate), format ='%Y%m%d')) %>%
+                # do not include end of data column, it is obsolete
+                select(-c(eor)) %>%
+                # on a mountain
+                filter(stationID != 5792)
+
+
+weather_data <- weather_data_processed %>%
+               filter(recordingDate >= start_day - maxLag & recordingDate <= end_day)
+
+
+r_start_day <-as.Date('2020-03-25')
+r_end_day <- as.Date('2020-06-07')
+weather_data_r <- weather_data_processed %>%
+               filter(recordingDate >= r_start_day - maxLag  & recordingDate <= r_end_day)
+
+summary(weather_data)
+summary(weather_data_r)
+timespan_days <- length(seq.Date(start_day - maxLag, end_day, by="day"))
+timespan_days_r <- length(seq.Date(r_start_day - maxLag, r_end_day, by="day"))
+paste("Number of days recording:",timespan_days)
+paste("Number of days recording for r analysis:",timespan_days_r)
+
+
+# HELPER FUNCTION
+filterInvalidStations <- function(weatherFrame, col, timespanDays){
+  tmp <-  weatherFrame[complete.cases(weatherFrame[ , col]), ]
+  invalid_stations <- tmp %>%
+              group_by(stationID) %>%
+              filter(n() != timespanDays) %>%
+              distinct(stationID)
+  return (tmp  %>%
+              filter(!(stationID %in% invalid_stations$stationID)))
+}
+
+
+# BY MEAN TEMPERATUR
+weather_data_tmp <- filterInvalidStations(weather_data, "dailyMeanTemp", timespan_days)
+weather_data_tmp_r <- filterInvalidStations(weather_data_r, "dailyMeanTemp", timespan_days_r)
+
+
+weather_data_tmp %>%
+  ggplot(aes(x=recordingDate, y=dailyMeanTemp, 
+             group = factor(stationID))) + 
+  geom_line(alpha = 0.04, color = "blue") + 
+  ylab("Mean daily temperature (C??)") + 
+  theme(legend.position = "none") + 
+  ggtitle("Mean daily temperatur (all weather stations)")
+
+weather_data_tmp %>% group_by(stationID) %>% summarise()
+weather_data_tmp_r %>%
+  ggplot(aes(x=recordingDate, y=dailyMeanTemp, 
+             group = factor(stationID))) + 
+  geom_line(alpha = 0.04, color = "blue") + 
+  ylab("Mean daily temperature (C??)") + 
+  theme(legend.position = "none") + 
+  ggtitle("Mean daily temperatur (all weather stations)")
+```
+
+```{r}
+# BY dailySunshineH !
+weather_data_sunshine <- filterInvalidStations(weather_data, "dailySunshineH", timespan_days) 
+weather_data_sunshine_r <- filterInvalidStations(weather_data_r, "dailySunshineH", timespan_days_r)
+
+
+weather_data_sunshine %>%
+  ggplot(aes(x=recordingDate, y=dailySunshineH, 
+             group = factor(stationID))) + 
+  geom_line(alpha = 0.04, color = "blue") + 
+  ylab("Mean daily sunhine duration in hours") + 
+  theme(legend.position = "none") + 
+  ggtitle("Mean daily sunshine duration in H (all weather stations)")
+```
+
+```{r}
+# BY dailyMeanWindMS !
+weather_data_wind <- filterInvalidStations(weather_data, "dailyMeanWindMS", timespan_days) 
+weather_data_wind_r <- filterInvalidStations(weather_data_r, "dailyMeanWindMS", timespan_days_r) 
+
+
+
+weather_data_wind %>%
+  ggplot(aes(x=recordingDate, y=dailyMeanWindMS, 
+             group = factor(stationID))) + 
+  geom_line(alpha = 0.04, color = "blue") + 
+  ylab("mean wind velocity [m/s]") + 
+  theme(legend.position = "none") + 
+  ggtitle("Daily mean in wind velocity m/s (all weather stations)")
+```
+```{r}
+# BY dailyMeanWindMS !
+weather_data_humidity <- filterInvalidStations(weather_data, "dailyMeanRelHumidity", timespan_days) 
+weather_data_humidity_r <- filterInvalidStations(weather_data_r, "dailyMeanRelHumidity", timespan_days_r) 
+
+weather_data_humidity %>%
+  ggplot(aes(x=recordingDate, y=dailyMeanRelHumidity, 
+             group = factor(stationID))) + 
+  geom_line(alpha = 0.04, color = "blue") + 
+  ylab("daily mean of relative humidity in %") + 
+  theme(legend.position = "none") + 
+  ggtitle("Daily mean of relative humidity in % (all weather stations)")
+
+```
+```{r}
+Nowcasting_Zahlen <- read_excel("input/Nowcasting_Zahlen.xlsx", 
+    sheet = "Nowcast_R")
+head(Nowcasting_Zahlen)
+
+r_values <- Nowcasting_Zahlen %>%
+          select(1,5,8,11)%>%
+          rename(
+             Erkrankungsbeginn = 1,
+             Neuerkrankungen = 2,
+             R = 3,
+             R_7 = 4
+          ) %>%
+        filter(!is.na(R)) %>%
+        filter(Erkrankungsbeginn >= r_start_day & Erkrankungsbeginn <= r_end_day)
+
+r_values
+```
+
+```{r}
+# HELPER FUNCTION
+
+getMeanVector <- function(dataframe, col, shift){
+  return (dataframe %>%
+          group_by(recordingDate) %>%
+          #!!!! IMPORTANT OPERATION. SHIFTING THE DATE OF RECORDING TO MATCH Refdatum! !!!!!
+          mutate(recordingDate = (recordingDate+shift)) %>%
+          summarise(mean = mean(get(col))))
+}
+
+joinResult_infections <- function(frameToJoin){
+  return (per_county_and_day %>%
+            filter(Refdatum >= start_day & Refdatum <= end_day) %>%
+          group_by(Refdatum) %>%
+          summarise(infections_per_day = sum(NeueFaelle)) %>%
+          inner_join(frameToJoin,
+               by = c("Refdatum" = "recordingDate")))
+}
+
+joinResult_r <- function(frameToJoin){
+  return (r_values %>%
+          filter(Erkrankungsbeginn >= r_start_day & Erkrankungsbeginn <= r_end_day) %>%
+          inner_join(frameToJoin,
+               by = c("Erkrankungsbeginn" = "recordingDate")))
+}
+
+fillCorList <- function(corList, resultFrame, shift, corMethod = "pearson"){
+  corFac <- cor(resultFrame["infections_per_day"], resultFrame["mean"],  method = corMethod, use = "complete.obs")
+  corList[[as.character(shift)]] <- corFac
+  print(paste("shift: ",shift," cor: ", corFac))
+}
+
+drawTwoLinesGraph <- function(df,x,xlab, y1, y1_lab, y1_leg, y2, y2_leg, y2_lab, scale, title, lag, corList){
+    ggplot(df, aes(x = x)) + 
+      geom_line(aes(y = y1, colour = y1_leg))+
+      geom_line(aes(y = mean*scale, colour = y2_leg))+
+      scale_y_continuous(sec.axis = sec_axis(~./scale, name = ))+ 
+      scale_colour_manual(values = c("blue", "red"))+ 
+      labs(y = y1_lab,
+                  x = xlab,
+                  colour = "Parameter")+ 
+      theme(legend.position = c(0.2, 0.87)) +
+     ggtitle(paste(title, lag, "days; cor=",specify_decimal(corList[[as.character(lag)]],4)))
+}
+```
+
+
+```{r}
+lag_for_plot <- 7
+lag_for_plot_r <- 7
+tempCorList <- c()
+tempCorList_r <- c()
+for(i in seq(0,maxLag)){
+  de_tmps <- getMeanVector(weather_data_tmp, col = "dailyMeanTemp", i)
+  de_tmps_r <- getMeanVector(weather_data_tmp_r, col = "dailyMeanTemp", i)
+  res <- joinResult_infections(de_tmps)
+  res_r <- joinResult_r(de_tmps_r)
+  
+  if(i == lag_for_plot){
+    resPlot <- res
+  }
+  
+  if(i == lag_for_plot_r){
+    resPlot_r <- res_r
+  }
+  tempCorList[[as.character(i)]] <- cor(res["infections_per_day"], res["mean"],  method = "pearson", use = "complete.obs")
+  
+  tempCorList_r[[as.character(i)]] <- cor(res_r["R"], res_r["mean"],  method = "pearson", use = "complete.obs")
+}
+
+tempCorList
+barplot(tempCorList, ylim=c(-1,1), main = "Correleation with diff day shift: new cases ~ temperature")
+barplot(tempCorList_r, ylim=c(-1,1), main = "Correleation with diff day shift: R ~ temperature")
+
+drawTwoLinesGraph(resPlot, resPlot$Refdatum, "Date", resPlot$infections_per_day, "Infections per day", "Infections", resPlot$mean ,"Mean Temp in C??", "Mean Temp", 400, "Infections and mean temp", lag_for_plot, tempCorList)
+
+drawTwoLinesGraph(resPlot_r, resPlot_r$Erkrankungsbeginn, "Date", resPlot_r$R, "R Value", "R", resPlot_r$mean ,"Mean Temp in C??", "Mean Temp", .05, "Infections and mean temp", lag_for_plot_r, tempCorList_r)
+```
+
+```{r}
+lag_for_plot <- 7
+lag_for_plot_r <- 5
+sunCorList <- c()
+sunCorList_r <- c()
+
+for(i in seq(0,maxLag)){
+  de_sun <- getMeanVector(weather_data_sunshine, col = "dailySunshineH", i)
+  de_sun_r <- getMeanVector(weather_data_sunshine_r, col = "dailySunshineH", i)
+  res <- joinResult_infections(de_sun)
+  res_r <- joinResult_r(de_sun_r)
+  
+  if(i == lag_for_plot){
+    resPlot <- res
+  }
+  if(i == lag_for_plot_r){
+    resPlot_r = res_r
+  }
+  
+  sunCorList[[as.character(i)]] <- cor(res["infections_per_day"], res["mean"],  method = "pearson", use = "complete.obs")
+  sunCorList_r[[as.character(i)]] <- cor(res_r["R"], res_r["mean"],  method = "pearson", use = "complete.obs")
+}
+sunCorList
+barplot(sunCorList, ylim=c(-1,1), main = "Correleation with diff day shift: new cases ~ sunshine duration")
+barplot(sunCorList_r, ylim=c(-1,1), main = "Correleation with diff day shift: R ~ sunshine duration")
+
+drawTwoLinesGraph(resPlot, resPlot$Refdatum, "Date", resPlot$infections_per_day, "Infections per day", "Infections", resPlot$mean ,"Mean sunshine duration in H", "Mean sunshine duration", 400, "Infections and mean sunshine duration", lag_for_plot, sunCorList)
+
+drawTwoLinesGraph(resPlot_r, resPlot_r$Erkrankungsbeginn, "Date",resPlot_r$R, "R Value", "R", resPlot_r$mean ,"Mean sunshine duration in H", "Mean sunshine duration", 0.05, "Infections and mean sunshine duration", lag_for_plot_r, sunCorList_r)
+```
+
+```{r}
+lag_for_plot <- 7
+lag_for_plot_r <- 7
+windCorList <- c()
+windCorList_r <- c()
+for(i in seq(0,maxLag)){
+   de_wind <- getMeanVector(weather_data_wind, col = "dailyMeanWindMS", i)
+  de_wind_r <- getMeanVector(weather_data_wind_r, col = "dailyMeanWindMS", i)
+  res <- joinResult_infections(de_wind)
+  res_r <- joinResult_r(de_wind_r)
+  
+     if(i == lag_for_plot){
+    resPlot <- res
+  }
+  if(i == lag_for_plot_r){
+    resPlot_r = res_r
+  }
+  
+  windCorList[[as.character(i)]] <- cor(res["infections_per_day"], res["mean"],  method = "pearson", use = "complete.obs")
+  windCorList_r[[as.character(i)]] <- cor(res_r["R"], res_r["mean"],  method = "pearson", use = "complete.obs")
+}
+windCorList
+
+barplot(windCorList, ylim=c(-1,1), main = "Correleation with diff day shift: new cases ~ wind velocity")
+barplot(windCorList_r, ylim=c(-1,1), main = "Correleation with diff day shift: R ~ wind velocity")
+
+
+
+drawTwoLinesGraph(resPlot, resPlot$Refdatum, "Date", resPlot$infections_per_day, "Infections per day", "Infections", resPlot$mean ,"Mean wind velocity in m/s", "Mean wind velocity", 850, "Infections per day and mean wind velocity", lag_for_plot, windCorList)
+
+drawTwoLinesGraph(resPlot_r, resPlot_r$Erkrankungsbeginn, "Date",resPlot_r$R, "R Value", "R", resPlot_r$mean ,"Mean wind velocity in m/s", "Mean wind velocity", 0.05, "Infections per day and mean wind velocity", lag_for_plot_r, windCorList_r)
+
+```
+```{r}
+lag_for_plot <- 7
+lag_for_plot_r <- 7
+humCorList <- c()
+humCorList_r <- c()
+
+for(i in seq(0,maxLag)){
+  de_humidity <- getMeanVector(weather_data_humidity, col = "dailyMeanRelHumidity", i)
+  de_humidity_r <- getMeanVector(weather_data_humidity_r, col = "dailyMeanRelHumidity", i)
+  res <- joinResult_infections(de_humidity)
+  res_r <- joinResult_r(de_humidity_r)
+  
+  if(i == lag_for_plot){
+    resPlot <- res
+  }
+  if(i == lag_for_plot_r){
+    resPlot_r = res_r
+  }
+     humCorList[[as.character(i)]] <- cor(res["infections_per_day"], res["mean"],  method = "pearson", use = "complete.obs")
+  humCorList_r[[as.character(i)]] <- cor(res_r["R"], res_r["mean"],  method = "pearson", use = "complete.obs")
+
+}
+
+barplot(humCorList, ylim=c(-1,1), main = "Correleation with diff day shift: new cases ~ rel. humidity")
+barplot(humCorList_r, ylim=c(-1,1), main = "Correleation with diff day shift: R ~ rel. humidity")
+
+humCorList
+
+ylim.prim <- c(0, 6500) 
+ylim.sec <- c(40, 80) 
+b <- diff(ylim.prim)/diff(ylim.sec)
+a <- b*(ylim.prim[1] - ylim.sec[1])
+
+ ggplot(resPlot, aes(x = Refdatum)) + 
+    geom_line(aes(y = infections_per_day, colour = "Infections"))+
+    geom_line(aes(y = a + mean*b, colour = "Mean relative Humidity"))+
+    scale_y_continuous(sec.axis = sec_axis(~ (. - a)/b, name = "Mean relative humidity in %??"))+ 
+    scale_colour_manual(values = c("blue", "red"))+ 
+    labs(y = "Infections per day",
+                x = "Date",
+                colour = "Parameter")+ 
+   ggtitle(paste("Infections and mean rel. humidity with LAG=",lag_for_plot, "days; cor=",specify_decimal(humCorList[lag_for_plot],4)))
+```
+
+```{r}
+
+Nowcasting_Zahlen <- read_excel("input/Nowcasting_Zahlen.xlsx", 
+    sheet = "Nowcast_R")
+head(Nowcasting_Zahlen)
+
+rep_data <- Nowcasting_Zahlen %>%
+          select(1,5,8,11)%>%
+          rename(
+             Erkrankungsbeginn = 1,
+             Neuerkrankungen = 2,
+             R = 3,
+             R_7 = 4
+          ) %>%
+        filter(!is.na(R)) %>%
+        filter(Erkrankungsbeginn > as.Date('2020-03-25') & Erkrankungsbeginn < as.Date('2020-06-07'))
+
+rep_data
+
+rep_data %>%
+  ggplot(aes(x=Erkrankungsbeginn, y=R)) + 
+  geom_line() + 
+  ylab("R") + 
+  theme(legend.position = "none") + 
+  ggtitle("R-Value Germany")
+```
+
